@@ -474,634 +474,646 @@
   </div>
 
   <script>
-    // --- KONFIGURASI DAN STATE ---
-    const WORKER_URL = "https://comics.rahardianananta-id.workers.dev";
-    const REPO_URLS = {
-        manhua: "https://raw.githubusercontent.com/AstraviaComics/repo_manhua/main",
-        manhwa: "https://raw.githubusercontent.com/AstraviaComics/repo_manhwa/main",
-        manga: "https://raw.githubusercontent.com/AstraviaComics/repo_manga/main"
-    };
-
-    let currentPage = 1;
-    let currentView = 'home';
-    let currentFilters = {};
-    let currentMode = 'home-lists';
-    let dataCache = new Map();
-
-    // --- ELEMEN UI ---
-    const searchInput = document.getElementById('q');
-    const clearBtn = document.getElementById('clear-btn');
-    const tabs = document.querySelectorAll('.tabs button');
-    const underline = document.querySelector('.tab-underline');
-    const appbar = document.querySelector('.appbar');
-    const filterBtn = document.getElementById('filter-btn');
-    const filterOverlay = document.getElementById('filter-overlay');
-    const closeFilterBtn = document.getElementById('close-filter-btn');
-    const appContainer = document.getElementById('app');
-
-    /* (OPTIMISASI 2) Cache semua elemen filter */
-    const authorInput = document.getElementById('authorInput');
-    const tahunInput = document.getElementById('tahunInput');
-    const ratingInput = document.getElementById('ratingInput');
-    const statusSelect = document.getElementById('statusSelect');
-    const genreListContainer = document.getElementById('genreListContainer');
-    
-    // --- FUNGSI INTI ROUTING (HASH-BASED) ---
-
-    function handleRouting() {
-        let path = window.location.hash.substring(1); 
-        if (!path.startsWith('/')) {
-            path = '/' + path;
-        }
-        const [pathOnly, queryString] = path.split('?');
-        const params = new URLSearchParams(queryString || '');
-
-        if (pathOnly.startsWith('/info/')) {
-            const parts = pathOnly.split('/'); 
-            if (parts.length === 4) {
-                const type = parts[2];
-                const slug = parts[3];
-                updateActiveTabUI(type); 
-                /* (OPTIMISASI 3) Tunda eksekusi berat */
-                deferHeavyWork(() => loadInfo(slug, type));
-                return;
-            }
-        }
-        
-        if (pathOnly.startsWith('/chapter/')) {
-             const parts = pathOnly.split('/');
-             if (parts.length >= 6) {
-                const type = parts[2];
-                const slug = parts[3];
-                const file = parts[4];
-                const judul = decodeURIComponent(parts[5]);
-                updateActiveTabUI(type);
-                /* (OPTIMISASI 3) Tunda eksekusi berat */
-                deferHeavyWork(() => loadChapter(slug, file, judul, type));
-                return;
-             }
-        }
-
-        if (pathOnly === '/manhwa' || pathOnly === '/manhua' || pathOnly === '/manga') {
-            const view = pathOnly.substring(1); // "manhwa"
-            
-            if (params.toString()) {
-                currentFilters = {
-                    search: params.get('search') || '',
-                    author: params.get('author') || '',
-                    tahun: params.get('tahun') || '',
-                    rating: params.get('rating') || '',
-                    type: view,
-                    status: params.get('status') || '',
-                    genre: params.get('genre') || '',
-                };
-                currentView = view;
-                currentMode = 'advanced-filter';
-                
-                updateActiveTabUI(currentView);
-                updateFilterInputsFromState(); 
-                
-                /* * (OPTIMISASI FINAL) Tunda 400ms. 
-                 * Ini untuk memberi waktu 350ms pada animasi appbar (logo/search)
-                 * agar selesai sebelum JS berat dijalankan.
-                 */
-                setTimeout(() => {
-                    deferHeavyWork(() => applyFiltersWorker(params.get('page') || 1, false));
-                }, 400); 
-                return;
-            }
-            
-            updateActiveTabUI(view);
-            handleTypeChange(view, false);
-            
-            /* (OPTIMISASI FINAL) Tunda 400ms untuk animasi appbar */
-            setTimeout(() => {
-                deferHeavyWork(() => loadPageFromRepo(params.get('page') || 1, false));
-            }, 400);
-            return;
-        }
-
-        updateActiveTabUI('home');
-        handleTypeChange('home', false); 
-    }
-
-    function updateURL(path, title) {
-        window.location.hash = path;
-        document.title = title; 
-    }
-
-    function updateFilterInputsFromState() {
-        /* (OPTIMISASI 2) Gunakan variabel yang sudah di-cache */
-        searchInput.value = currentFilters.search || '';
-        authorInput.value = currentFilters.author || '';
-        tahunInput.value = currentFilters.tahun || '';
-        ratingInput.value = currentFilters.rating || '';
-        statusSelect.value = currentFilters.status || '';
-        
-        const genres = (currentFilters.genre || '').split(',');
-        genreListContainer.querySelectorAll('input').forEach(checkbox => {
-            checkbox.checked = genres.includes(checkbox.value);
-        });
-    }
-    
-    function updateActiveTabUI(view) {
-        tabs.forEach(btn => {
-            const tabName = btn.querySelector('span').textContent.toLowerCase();
-            btn.classList.toggle('active', tabName === view);
-        });
-        const activeBtn = document.querySelector('.tabs button.active');
-        if (activeBtn) {
-            moveUnderline(activeBtn);
-            updateUIVisibility(activeBtn.querySelector('span').textContent);
-        }
-    }
-
-
-    // --- FUNGSI LOGIKA INTI ---
-
-    function handleTypeChange(newView, update = true) {
-        if (newView === 'home') {
-            if(update) updateURL('/', "ReComic's Home");
-            currentView = 'home';
-            currentMode = 'home-lists';
-            
-            /* * (OPTIMISASI FINAL) Tunda 400ms.
-             * Bahkan update innerHTML yang ringan ini ditunda
-             * agar animasi appbar (logo/search) kembali mulus.
-             */
-            setTimeout(() => {
-                appContainer.innerHTML = `<p style="text-align: center; margin-top: 40px; color: var(--muted);'>Bagian Home akan dikerjakan nanti.</p>`;
-            }, 400);
-            return;
-        }
-
-        if (currentView !== newView) {
-            loadGenres(); // Ini cepat (biasanya dari cache) jadi tidak perlu ditunda
-        }
-
-        currentView = newView;
-        currentFilters = {};
-        currentMode = 'browse';
-        searchInput.value = ''; 
-        clearBtn.classList.remove('visible');
-        
-        if (update) {
-            updateURL(`/${newView}`, `Daftar ${capitalize(newView)}`);
-            
-            /* (OPTIMISASI FINAL) Tunda 400ms untuk animasi appbar */
-            setTimeout(() => {
-                deferHeavyWork(() => loadPageFromRepo(1, false));
-            }, 400); 
-        }
-    }
-
-    function handleFilter() {
-        if (currentView === 'home') return; 
-        
-        currentMode = 'advanced-filter';
-        /* (OPTIMISASI 2) Gunakan variabel yang sudah di-cache */
-        currentFilters = {
-            search: searchInput.value.trim(), 
-            author: authorInput.value.trim(),
-            tahun: tahunInput.value.trim(),
-            rating: ratingInput.value.trim(),
-            type: currentView,
-            status: statusSelect.value,
-            genre: Array.from(genreListContainer.querySelectorAll('input:checked')).map(cb => cb.value).join(','),
-        };
-        
-        const params = new URLSearchParams();
-        if (currentFilters.search) params.append('search', currentFilters.search);
-        if (currentFilters.author) params.append('author', currentFilters.author);
-        if (currentFilters.tahun) params.append('tahun', currentFilters.tahun);
-        if (currentFilters.rating) params.append('rating', currentFilters.rating);
-        if (currentFilters.status) params.append('status', currentFilters.status);
-        if (currentFilters.genre) params.append('genre', currentFilters.genre);
-        
-        const paramString = params.toString();
-        const newPath = `/${currentView}` + (paramString ? `?${paramString}` : '');
-        updateURL(newPath, `Filter: ${currentView}`);
-        
-        /* (OPTIMISASI 3) Tunda eksekusi berat */
-        /* Filter tidak memicu animasi appbar, jadi tidak perlu delay 400ms */
-        deferHeavyWork(() => applyFiltersWorker(1, false));
-        filterOverlay.classList.remove('visible');
-    }
-
-    async function loadPageFromRepo(page = 1, update = true) {
-        currentMode = 'browse';
-        appContainer.innerHTML = "<p>Loading...</p>";
-        
-        const pageQuery = page > 1 ? `?page=${page}` : '';
-        if(update) updateURL(`/${currentView}${pageQuery}`, `Daftar ${capitalize(currentView)} - Hal ${page}`);
-
-        const cacheKey = `${currentView}-page-${page}`;
-        const url = `${REPO_URLS[currentView]}/page_${page}.json`;
-
-        try {
-            const data = await fetchAndCache(url, cacheKey, 'json');
-            currentPage = page;
-            displayComics(data); // (OPTIMISASI 4) Panggil fungsi baru
-            const hasNext = data.length > 0;
-            const pagination = createPagination({ currentPage: page, hasNextPage: hasNext });
-            appContainer.appendChild(pagination);
-        } catch(e) {
-            console.error(e);
-            appContainer.innerHTML = "<p>Halaman tidak ditemukan atau sudah habis.</p>";
-            if(page > 1) {
-                const pagination = createPagination({ currentPage: page, hasNextPage: false });
-                appContainer.appendChild(pagination);
-            }
-        }
-    }
-
-    async function applyFiltersWorker(page = 1, update = true) {
-        appContainer.innerHTML = "<p>Mencari komik...</p>";
-        
-        const params = new URLSearchParams();
-        if (currentFilters.search) params.append('search', currentFilters.search);
-        if (currentFilters.author) params.append('author', currentFilters.author);
-        if (currentFilters.tahun) params.append('tahun', currentFilters.tahun);
-        if (currentFilters.rating) params.append('rating', currentFilters.rating);
-        if (currentFilters.status) params.append('status', currentFilters.status);
-        if (currentFilters.genre) params.append('genre', currentFilters.genre);
-        
-        params.append('page', page);
-        params.append('type', currentFilters.type);
-        params.append('limit', 40);
-
-        if(update) {
-            const pageParams = new URLSearchParams(params.toString());
-            pageParams.delete('limit'); 
-            pageParams.delete('type'); 
-            const newPath = `/${currentFilters.type}?${pageParams.toString()}`;
-            updateURL(newPath, `Filter Hasil - Hal ${page}`);
-        }
-
-        const cacheKey = `filter-${params.toString()}`;
-        const url = `${WORKER_URL}?${params.toString()}`;
-
-        try {
-            const result = await fetchAndCache(url, cacheKey, 'json');
-            currentPage = result.page;
-            displayComics(result.data); // (OPTIMISASI 4) Panggil fungsi baru
-            const pagination = createPagination({ currentPage: result.page, totalPages: result.total_pages });
-            appContainer.appendChild(pagination);
-        } catch (error) {
-            appContainer.innerHTML = "<p>Gagal melakukan pencarian. Coba lagi nanti.</p>";
-        }
-    }
-
-    async function loadInfo(slug, type) {
-        appContainer.innerHTML = "<p>Memuat detail komik...</p>";
-        
-        updateURL(`/info/${type}/${slug}`, `Info Komik`);
-
-        try {
-            const baseUrl = REPO_URLS[type];
-            if (!baseUrl) throw new Error(`Tipe repo tidak valid: ${type}`);
-            
-            const infoKey = `${type}-${slug}-info`;
-            const chapterListKey = `${type}-${slug}-chapterlist`;
-
-            const [info, chapterListData] = await Promise.all([
-                fetchAndCache(`${baseUrl}/${slug}/info.json`, infoKey, 'json'),
-                fetchAndCache(`${baseUrl}/${slug}/chapter_list.json`, chapterListKey, 'json')
-            ]);
-            
-            document.title = info.judul; 
-
-            appContainer.innerHTML = `
-                <div class="back" onclick="goBack()">← Kembali</div>
-                <div class="comic-info-container">
-                    <img src="${info.thumbnail}" alt="${info.judul}">
-                    <div class="comic-info-details">
-                        <h2>${info.judul}</h2>
-                        <p><b>Tipe:</b> ${info.tipe || "N/A"}</p>
-                        <p><b>Rilis:</b> ${info.released || "N/A"}</p>
-                        <p><b>Author:</b> ${info.author || "N/A"}</p>
-                        <p><b>Status:</b> ${info.status || "N/A"}</p>
-                        <p><b>Rating:</b> ${info.rating || "N/A"}</p>
-                        <p><b>Genre:</b> ${(info.genre || []).join(", ")}</p>
-                    </div>
-                </div>
-                <p style="margin-top: 16px; color: var(--muted);">${info.synopsis || "N/A"}</p>
-                <div class="chapter-list">
-                    <h3>Daftar Chapter</h3>
-                    <div id="chapters"></div>
-                </div>
-            `;
-
-            const chaptersContainer = document.getElementById("chapters");
-            Object.entries(chapterListData.chapters || {}).forEach(([title, meta]) => {
-                const div = document.createElement("div");
-                div.className = "chapter";
-                div.innerText = `${title} (${meta.tanggal || 'N/A'})`;
-                div.onclick = () => loadChapter(slug, meta.file, info.judul, type);
-                chaptersContainer.appendChild(div);
-            });
-
-        } catch (e) {
-            console.error("Gagal loadInfo:", e);
-            appContainer.innerHTML = `<p>Gagal memuat detail komik.</p><div class="back" onclick="goBack()">← Kembali</div>`;
-        }
-    }
-
-    async function loadChapter(slug, chapterFile, komikJudul, type) {
-        appContainer.innerHTML = "<p>Memuat chapter...</p>";
-        
-        const safeJudul = encodeURIComponent(komikJudul);
-        updateURL(`/chapter/${type}/${slug}/${chapterFile}/${safeJudul}`, komikJudul);
-
-        try {
-            const baseUrl = REPO_URLS[type];
-            const cacheKey = `${type}-${slug}-${chapterFile}`;
-            const url = `${baseUrl}/${slug}/${chapterFile}`;
-
-            const data = await fetchAndCache(url, cacheKey, 'json');
-            const html = (data.gambar_urls || []).map(url => `<img src="${url}" loading="lazy">`).join("");
-
-            appContainer.innerHTML = `
-                <div class="back" onclick="loadInfo('${slug}', '${type}')">← Kembali ke Info Komik</div>
-                <h2 style="text-align:center; color: var(--text);">${komikJudul}</h2>
-                <div class="reader">${html}</div>
-                <div class="back" onclick="loadInfo('${slug}', '${type}')" style="margin-top:20px;">← Kembali ke Info Komik</div>
-            `;
-            window.scrollTo(0, 0);
-        } catch (e) {
-            console.error("Gagal loadChapter:", e);
-            appContainer.innerHTML = `<p>Gagal memuat chapter.</p><div class="back" onclick="loadInfo('${slug}', '${type}')">← Kembali ke Info Komik</div>`;
-        }
-    }
-
-    function goBack() {
-        history.back(); // Ini akan memicu 'hashchange'
-    }
-
-
-    // --- FUNGSI HELPER (CACHE, RATING, UI, DLL) ---
-
-    /**
-     * (OPTIMISASI 3) 
-     * Menjalankan fungsi callback saat browser sedang idle (tidak sibuk).
-     */
-    function deferHeavyWork(callback) {
-      if ('requestIdleCallback' in window) {
-        // Gunakan API modern jika ada (Chrome, Firefox, Edge)
-        window.requestIdleCallback(callback, { timeout: 2000 }); // timeout 2 detik
-      } else {
-        // Fallback untuk browser (seperti Safari)
-        setTimeout(callback, 1); 
-      }
-    }
-
-    async function fetchAndCache(url, cacheKey, type = 'json') {
-        if (dataCache.has(cacheKey)) {
-            return dataCache.get(cacheKey);
-        }
-        const res = await fetch(url);
-        if (!res.ok) {
-            throw new Error(`Gagal memuat: ${url}`);
-        }
-        const data = (type === 'json') ? await res.json() : await res.text();
-        dataCache.set(cacheKey, data);
-        return data;
-    }
-
-    function generateStars(rating) {
-        const score = (parseFloat(rating) || 0) / 2;
-        let html = '';
-        for (let i = 1; i <= 5; i++) {
-            if (i <= score) {
-                html += '<i class="ph-fill ph-star"></i>';
-            } else if (i - 0.5 <= score) {
-                html += '<i class="ph-fill ph-star-half"></i>'; 
-            } else {
-                html += '<i class="ph ph-star"></i>';
-            }
-        }
-        return html;
-    }
-
-    /**
-     * (OPTIMISASI 4) Menggantikan createCardHTML
-     * Fungsi ini membuat ELEMEN DOM murni, bukan string.
-     */
-    function createCardElement(item) {
-        const itemTipe = (item.tipe || currentView).toLowerCase();
-        const judul = item.judul || 'Tanpa Judul';
-        const slug = item.slug;
-        const thumbnail = item.thumbnail;
-        const ratingScore = item.rating ? parseFloat(item.rating).toFixed(1) : '0.0';
-        const starHTML = generateStars(item.rating); // String kecil ini tidak masalah
-
-        const card = document.createElement('div');
-        card.className = 'card';
-        card.onclick = () => loadInfo(slug, itemTipe);
-
-        card.innerHTML = `
-            <img src="${thumbnail}" alt="${judul}" loading="lazy">
-            <div class="title">${judul}</div>
-            <div class="rating-info">
-                <div class="stars-container">${starHTML}</div>
-                <span class="rating-score">${ratingScore}</span>
-            </div>`;
-        return card;
-    }
-
-    /**
-     * (OPTIMISASI 4) Menggunakan DocumentFragment
-     * Ini adalah cara paling efisien untuk me-render banyak elemen ke DOM.
-     */
-    function displayComics(data) {
-        if (!data || data.length === 0) {
-            appContainer.innerHTML = "<p>Tidak ada komik yang ditemukan.</p>";
-            return;
-        }
-
-        const grid = document.createElement('div');
-        grid.className = 'grid';
-        
-        // 1. Buat "keranjang" di memori
-        const fragment = document.createDocumentFragment();
-
-        // 2. Isi keranjang dengan elemen card (masih di memori)
-        data.forEach(item => {
-            fragment.appendChild(createCardElement(item));
-        });
-
-        // 3. Masukkan keranjang ke grid (masih di memori)
-        grid.appendChild(fragment);
-        
-        // 4. Hapus "Loading..." dan "tuang" grid ke DOM (HANYA 1x Operasi)
-        appContainer.innerHTML = ''; 
-        appContainer.appendChild(grid);
-    }
-
-
-    function createPagination({ currentPage, totalPages, hasNextPage = false }) {
-        const pagination = document.createElement("div");
-        pagination.className = "pagination";
-        let buttonsHTML = '';
-        
-        const prevPage = currentPage - 1;
-        const nextPage = currentPage + 1;
-        let prevAction, nextAction;
-
-        switch(currentMode) {
-            case 'advanced-filter':
-                prevAction = `applyFiltersWorker(${prevPage}, true)`;
-                nextAction = `applyFiltersWorker(${nextPage}, true)`;
-                break;
-            default: // 'browse'
-                prevAction = `loadPageFromRepo(${prevPage}, true)`;
-                nextAction = `loadPageFromRepo(${nextPage}, true)`;
-        }
-
-        if (currentPage > 1) {
-            buttonsHTML += `<button class="page-btn" onclick="${prevAction}">⬅ Sebelumnya</button>`;
-        }
-        if ((currentMode !== 'browse' && currentPage < totalPages) || (currentMode === 'browse' && hasNextPage)) {
-            buttonsHTML += `<button class="page-btn" onclick="${nextAction}">Berikutnya ➡</button>`;
-        }
-
-        pagination.innerHTML = buttonsHTML;
-        return pagination;
-    }
-
-    function resetFilters() {
-        /* (OPTIMISASI 2) Gunakan variabel yang sudah di-cache */
-        authorInput.value = '';
-        tahunInput.value = '';
-        ratingInput.value = '';
-        statusSelect.value = '';
-        genreListContainer.querySelectorAll('input:checked').forEach(cb => cb.checked = false);
-    }
-
-    async function loadGenres() {
-        /* (OPTIMISASI 2) Gunakan variabel yang sudah di-cache */
-        const container = genreListContainer; 
-        if (currentView === 'home') {
-            container.innerHTML = "Pilih tipe komik untuk melihat genre.";
-            return;
-        }
-        const cacheKey = `${currentView}-genres`;
-        const url = `${REPO_URLS[currentView]}/genres.json`;
-        try {
-            const data = await fetchAndCache(url, cacheKey, 'json');
-            buildGenreList(data);
-        } catch (e) {
-            container.innerHTML = "<p>Gagal memuat genre.</p>";
-        }
-    }
-
-    function buildGenreList(data) {
-        /* (OPTIMISASI 2) Gunakan variabel yang sudah di-cache */
-        const container = genreListContainer;
-        container.innerHTML = (data.list || [])
-            .map(g => `<label><input type="checkbox" value="${g}"> ${g}</label>`)
-            .join("");
-        
-        if(currentMode === 'advanced-filter') {
-            updateFilterInputsFromState();
-        }
-    }
-
-    function capitalize(s) {
-        return s ? s.charAt(0).toUpperCase() + s.slice(1) : '';
-    }
-
-    function handleSearchClear() {
-      searchInput.addEventListener('input', () => {
-        clearBtn.classList.toggle('visible', searchInput.value.length > 0);
-      });
-      clearBtn.addEventListener('click', () => {
-        searchInput.value = '';
-        clearBtn.classList.remove('visible');
-        searchInput.focus();
-        if (currentMode === 'advanced-filter') {
-            handleFilter();
-        }
-      });
-    }
-
-    function moveUnderline(button) {
-      const textSpan = button.querySelector('span');
-      if (!textSpan) return;
-      const textWidth = textSpan.offsetWidth;
-      const buttonLeft = button.offsetLeft;
-      const buttonWidth = button.offsetWidth;
-      const leftPosition = buttonLeft + (buttonWidth - textWidth) / 2;
-      
-      /* (OPTIMISASI 1) Ganti 'left' dengan 'transform' dan 'width' */
-      underline.style.width = textWidth + 'px';
-      underline.style.transform = `translateX(${leftPosition}px)`;
-    }
-
-    function updateUIVisibility(tabName) {
-      if (tabName === 'Home') {
-        appbar.classList.remove('search-expanded');
-        filterBtn.classList.remove('visible');
-        searchInput.placeholder = "Cari di ReComic's...";
-      } else {
-        appbar.classList.add('search-expanded');
-        filterBtn.classList.add('visible');
-        searchInput.placeholder = `Cari di ${tabName}...`;
-      }
-    }
-
-    // --- INISIALISASI DAN EVENT LISTENER ---
-
-    function initializeApp() {
-        handleSearchClear();
-
-        window.addEventListener('hashchange', handleRouting);
-
-        tabs.forEach(btn => {
-          btn.addEventListener('click', (e) => {
-            if (btn.classList.contains('active')) return;
-            const tabName = btn.querySelector('span').textContent.toLowerCase();
-            
-            /* --- (OPTIMISASI 5) INI PERUBAHAN PALING PENTING --- */
-            
-            // 1. Jalankan animasi UI SEGERA
-            // Ini akan memicu animasi appbar (logo/search) DAN underline
-            updateActiveTabUI(tabName); 
-            
-            // 2. Panggil logika SETELAH UI di-update
-            // (handleTypeChange akan mendefer loading data)
-            handleTypeChange(tabName, true); 
-          });
-        });
-        
-        searchInput.addEventListener('keypress', function(e) {
-            if (e.key === 'Enter') {
-                e.preventDefault(); 
-                if (currentView !== 'home') {
-                    handleFilter(); // handleFilter akan mengupdate HASH & menunda load
-                    searchInput.blur();
-                }
-            }
-        });
-
-        // Listener untuk panel filter
-        filterBtn.addEventListener('click', () => {
-          filterOverlay.classList.add('visible');
-        });
-        closeFilterBtn.addEventListener('click', () => {
-          filterOverlay.classList.remove('visible');
-        });
-        filterOverlay.addEventListener('click', (e) => {
-          if (e.target === filterOverlay) {
-            filterOverlay.classList.remove('visible');
-          }
-        });
-
-        // Panggil router untuk memuat halaman awal berdasarkan HASH
-        handleRouting();
-    }
-
-    document.addEventListener("DOMContentLoaded", initializeApp);
+// --- KONFIGURASI DAN STATE ---
+    const WORKER_URL = "https://comics.rahardianananta-id.workers.dev";
+    // REPO_URLS DIHAPUS DARI SINI (PINDAH KE WORKER)
+
+    let currentPage = 1;
+    let currentView = 'home';
+    let currentFilters = {};
+    let currentMode = 'home-lists';
+    let dataCache = new Map();
+
+    // --- ELEMEN UI ---
+    const searchInput = document.getElementById('q');
+    const clearBtn = document.getElementById('clear-btn');
+    const tabs = document.querySelectorAll('.tabs button');
+    const underline = document.querySelector('.tab-underline');
+    const appbar = document.querySelector('.appbar');
+    const filterBtn = document.getElementById('filter-btn');
+    const filterOverlay = document.getElementById('filter-overlay');
+    const closeFilterBtn = document.getElementById('close-filter-btn');
+    const appContainer = document.getElementById('app');
+
+    /* (OPTIMISASI 2) Cache semua elemen filter */
+    const authorInput = document.getElementById('authorInput');
+    const tahunInput = document.getElementById('tahunInput');
+    const ratingInput = document.getElementById('ratingInput');
+    const statusSelect = document.getElementById('statusSelect');
+    const genreListContainer = document.getElementById('genreListContainer');
+    
+    // --- FUNGSI INTI ROUTING (HASH-BASED) ---
+
+    function handleRouting() {
+        let path = window.location.hash.substring(1); 
+        if (!path.startsWith('/')) {
+            path = '/' + path;
+        }
+        const [pathOnly, queryString] = path.split('?');
+        const params = new URLSearchParams(queryString || '');
+
+        if (pathOnly.startsWith('/info/')) {
+            const parts = pathOnly.split('/'); 
+            if (parts.length === 4) {
+                const type = parts[2];
+                const slug = parts[3];
+                updateActiveTabUI(type); 
+                /* (OPTIMISASI 3) Tunda eksekusi berat */
+                deferHeavyWork(() => loadInfo(slug, type));
+                return;
+            }
+        }
+        
+        if (pathOnly.startsWith('/chapter/')) {
+             const parts = pathOnly.split('/');
+             if (parts.length >= 6) {
+                const type = parts[2];
+                const slug = parts[3];
+                const file = parts[4];
+                const judul = decodeURIComponent(parts[5]);
+                updateActiveTabUI(type);
+                /* (OPTIMISASI 3) Tunda eksekusi berat */
+                deferHeavyWork(() => loadChapter(slug, file, judul, type));
+                return;
+             }
+        }
+
+        if (pathOnly === '/manhwa' || pathOnly === '/manhua' || pathOnly === '/manga') {
+            const view = pathOnly.substring(1); // "manhwa"
+            
+            if (params.toString()) {
+                currentFilters = {
+                    search: params.get('search') || '',
+                    author: params.get('author') || '',
+                    tahun: params.get('tahun') || '',
+                    rating: params.get('rating') || '',
+                    type: view,
+                    status: params.get('status') || '',
+                    genre: params.get('genre') || '',
+                };
+                currentView = view;
+                currentMode = 'advanced-filter';
+                
+                updateActiveTabUI(currentView);
+                updateFilterInputsFromState(); 
+                
+                /* * (OPTIMISASI FINAL) Tunda 400ms. 
+                 * Ini untuk memberi waktu 350ms pada animasi appbar (logo/search)
+                 * agar selesai sebelum JS berat dijalankan.
+                 */
+                setTimeout(() => {
+                    deferHeavyWork(() => applyFiltersWorker(params.get('page') || 1, false));
+                }, 400); 
+                return;
+            }
+            
+            updateActiveTabUI(view);
+            handleTypeChange(view, false);
+            
+            /* (OPTIMISASI FINAL) Tunda 400ms untuk animasi appbar */
+            setTimeout(() => {
+                deferHeavyWork(() => loadPageFromRepo(params.get('page') || 1, false));
+            }, 400);
+            return;
+        }
+
+        updateActiveTabUI('home');
+        handleTypeChange('home', false); 
+    }
+
+    function updateURL(path, title) {
+        window.location.hash = path;
+        document.title = title; 
+    }
+
+    function updateFilterInputsFromState() {
+        /* (OPTIMISASI 2) Gunakan variabel yang sudah di-cache */
+        searchInput.value = currentFilters.search || '';
+        authorInput.value = currentFilters.author || '';
+        tahunInput.value = currentFilters.tahun || '';
+        ratingInput.value = currentFilters.rating || '';
+        statusSelect.value = currentFilters.status || '';
+        
+        const genres = (currentFilters.genre || '').split(',');
+        genreListContainer.querySelectorAll('input').forEach(checkbox => {
+            checkbox.checked = genres.includes(checkbox.value);
+        });
+    }
+    
+    function updateActiveTabUI(view) {
+        tabs.forEach(btn => {
+            const tabName = btn.querySelector('span').textContent.toLowerCase();
+            btn.classList.toggle('active', tabName === view);
+        });
+        const activeBtn = document.querySelector('.tabs button.active');
+        if (activeBtn) {
+            moveUnderline(activeBtn);
+            updateUIVisibility(activeBtn.querySelector('span').textContent);
+        }
+    }
+
+
+    // --- FUNGSI LOGIKA INTI ---
+
+    function handleTypeChange(newView, update = true) {
+        if (newView === 'home') {
+            if(update) updateURL('/', "ReComic's Home");
+            currentView = 'home';
+            currentMode = 'home-lists';
+            
+            /* * (OPTIMISASI FINAL) Tunda 400ms.
+             * Bahkan update innerHTML yang ringan ini ditunda
+             * agar animasi appbar (logo/search) kembali mulus.
+             */
+            setTimeout(() => {
+                appContainer.innerHTML = `<p style="text-align: center; margin-top: 40px; color: var(--muted);'>Bagian Home akan dikerjakan nanti.</p>`;
+            }, 400);
+            return;
+        }
+
+        if (currentView !== newView) {
+            loadGenres(); // Ini cepat (biasanya dari cache) jadi tidak perlu ditunda
+        }
+
+        currentView = newView;
+        currentFilters = {};
+        currentMode = 'browse';
+        searchInput.value = ''; 
+        clearBtn.classList.remove('visible');
+        
+        if (update) {
+            updateURL(`/${newView}`, `Daftar ${capitalize(newView)}`);
+            
+            /* (OPTIMISASI FINAL) Tunda 400ms untuk animasi appbar */
+            setTimeout(() => {
+                deferHeavyWork(() => loadPageFromRepo(1, false));
+            }, 400); 
+        }
+    }
+
+    function handleFilter() {
+        if (currentView === 'home') return; 
+        
+        currentMode = 'advanced-filter';
+        /* (OPTIMISASI 2) Gunakan variabel yang sudah di-cache */
+        currentFilters = {
+            search: searchInput.value.trim(), 
+            author: authorInput.value.trim(),
+            tahun: tahunInput.value.trim(),
+            rating: ratingInput.value.trim(),
+            type: currentView,
+            status: statusSelect.value,
+            genre: Array.from(genreListContainer.querySelectorAll('input:checked')).map(cb => cb.value).join(','),
+        };
+        
+        const params = new URLSearchParams();
+        if (currentFilters.search) params.append('search', currentFilters.search);
+        if (currentFilters.author) params.append('author', currentFilters.author);
+        if (currentFilters.tahun) params.append('tahun', currentFilters.tahun);
+        if (currentFilters.rating) params.append('rating', currentFilters.rating);
+        if (currentFilters.status) params.append('status', currentFilters.status);
+        if (currentFilters.genre) params.append('genre', currentFilters.genre);
+        
+        const paramString = params.toString();
+        const newPath = `/${currentView}` + (paramString ? `?${paramString}` : '');
+        updateURL(newPath, `Filter: ${currentView}`);
+        
+        /* (OPTIMISASI 3) Tunda eksekusi berat */
+        /* Filter tidak memicu animasi appbar, jadi tidak perlu delay 400ms */
+        deferHeavyWork(() => applyFiltersWorker(1, false));
+        filterOverlay.classList.remove('visible');
+    }
+
+    async function loadPageFromRepo(page = 1, update = true) {
+        currentMode = 'browse';
+        appContainer.innerHTML = "<p>Loading...</p>";
+        
+        const pageQuery = page > 1 ? `?page=${page}` : '';
+        if(update) updateURL(`/${currentView}${pageQuery}`, `Daftar ${capitalize(currentView)} - Hal ${page}`);
+
+        const cacheKey = `${currentView}-page-${page}`;
+        // === PERUBAHAN ===
+        // URL sekarang menunjuk ke Worker dengan aksi 'getPage'
+        const url = `${WORKER_URL}?action=getPage&type=${currentView}&page=${page}`;
+        // =================
+
+        try {
+            const data = await fetchAndCache(url, cacheKey, 'json');
+            currentPage = page;
+            displayComics(data); // (OPTIMISASI 4) Panggil fungsi baru
+            const hasNext = data.length > 0; // Asumsi sederhana, bisa disesuaikan
+            const pagination = createPagination({ currentPage: page, hasNextPage: hasNext });
+            appContainer.appendChild(pagination);
+        } catch(e) {
+            console.error(e);
+            appContainer.innerHTML = "<p>Halaman tidak ditemukan atau sudah habis.</p>";
+            if(page > 1) {
+                const pagination = createPagination({ currentPage: page, hasNextPage: false });
+                appContainer.appendChild(pagination);
+            }
+        }
+    }
+
+    async function applyFiltersWorker(page = 1, update = true) {
+        appContainer.innerHTML = "<p>Mencari komik...</p>";
+        
+        const params = new URLSearchParams();
+        if (currentFilters.search) params.append('search', currentFilters.search);
+        if (currentFilters.author) params.append('author', currentFilters.author);
+        if (currentFilters.tahun) params.append('tahun', currentFilters.tahun);
+        if (currentFilters.rating) params.append('rating', currentFilters.rating);
+        if (currentFilters.status) params.append('status', currentFilters.status);
+        if (currentFilters.genre) params.append('genre', currentFilters.genre);
+        
+        params.append('page', page);
+        params.append('type', currentFilters.type);
+        params.append('limit', 40); // Tetap kirim 'type' agar worker tahu repo mana yg difilter
+
+        if(update) {
+            const pageParams = new URLSearchParams(params.toString());
+            pageParams.delete('limit'); 
+            pageParams.delete('type'); 
+            const newPath = `/${currentFilters.type}?${pageParams.toString()}`;
+            updateURL(newPath, `Filter Hasil - Hal ${page}`);
+        }
+
+        // === TIDAK BERUBAH ===
+        // Fungsi ini sudah benar memanggil worker
+        const cacheKey = `filter-${params.toString()}`;
+        const url = `${WORKER_URL}?${params.toString()}`;
+        // ======================
+
+        try {
+            const result = await fetchAndCache(url, cacheKey, 'json');
+            currentPage = result.page;
+            displayComics(result.data); // (OPTIMISASI 4) Panggil fungsi baru
+            const pagination = createPagination({ currentPage: result.page, totalPages: result.total_pages });
+            appContainer.appendChild(pagination);
+        } catch (error) {
+            appContainer.innerHTML = "<p>Gagal melakukan pencarian. Coba lagi nanti.</p>";
+        }
+    }
+
+    async function loadInfo(slug, type) {
+        appContainer.innerHTML = "<p>Memuat detail komik...</p>";
+        
+        updateURL(`/info/${type}/${slug}`, `Info Komik`);
+
+        try {
+            // === PERUBAHAN ===
+            // Hanya 1 request ke worker untuk ambil info DAN chapter list
+            const cacheKey = `${type}-${slug}-info-chapters`;
+            const url = `${WORKER_URL}?action=getInfo&type=${type}&slug=${slug}`;
+            
+            const data = await fetchAndCache(url, cacheKey, 'json');
+            
+            // Worker akan mengembalikan objek { info: {...}, chapterList: {...} }
+            const info = data.info;
+            const chapterListData = data.chapterList;
+            // =================
+
+            if (!info || !chapterListData) {
+              throw new Error("Data info atau chapter list tidak lengkap dari worker.");
+            }
+            
+            document.title = info.judul; 
+
+            appContainer.innerHTML = `
+                <div class="back" onclick="goBack()">← Kembali</div>
+                <div class="comic-info-container">
+                    <img src="${info.thumbnail}" alt="${info.judul}">
+                    <div class="comic-info-details">
+                        <h2>${info.judul}</h2>
+                        <p><b>Tipe:</b> ${info.tipe || "N/A"}</p>
+                        <p><b>Rilis:</b> ${info.released || "N/A"}</p>
+                        <p><b>Author:</b> ${info.author || "N/A"}</p>
+                        <p><b>Status:</b> ${info.status || "N/A"}</p>
+                        <p><b>Rating:</b> ${info.rating || "N/A"}</p>
+                        <p><b>Genre:</b> ${(info.genre || []).join(", ")}</p>
+                    </div>
+                </div>
+                <p style="margin-top: 16px; color: var(--muted);">${info.synopsis || "N/A"}</p>
+                <div class="chapter-list">
+                    <h3>Daftar Chapter</h3>
+                    <div id="chapters"></div>
+    _           </div>
+            `;
+
+            const chaptersContainer = document.getElementById("chapters");
+            Object.entries(chapterListData.chapters || {}).forEach(([title, meta]) => {
+                const div = document.createElement("div");
+                div.className = "chapter";
+                div.innerText = `${title} (${meta.tanggal || 'N/A'})`;
+                div.onclick = () => loadChapter(slug, meta.file, info.judul, type);
+                chaptersContainer.appendChild(div);
+            });
+
+        } catch (e) {
+            console.error("Gagal loadInfo:", e);
+            appContainer.innerHTML = `<p>Gagal memuat detail komik.</p><div class="back" onclick="goBack()">← Kembali</div>`;
+        }
+    }
+
+    async function loadChapter(slug, chapterFile, komikJudul, type) {
+        appContainer.innerHTML = "<p>Memuat chapter...</p>";
+        
+        const safeJudul = encodeURIComponent(komikJudul);
+        updateURL(`/chapter/${type}/${slug}/${chapterFile}/${safeJudul}`, komikJudul);
+
+        try {
+            // === PERUBAHAN ===
+            // URL menunjuk ke Worker dengan aksi 'getChapter'
+            const cacheKey = `${type}-${slug}-${chapterFile}`;
+            const url = `${WORKER_URL}?action=getChapter&type=${type}&slug=${slug}&file=${chapterFile}`;
+            // =================
+
+            const data = await fetchAndCache(url, cacheKey, 'json');
+            const html = (data.gambar_urls || []).map(url => `<img src="${url}" loading="lazy">`).join("");
+
+            appContainer.innerHTML = `
+                <div class="back" onclick="loadInfo('${slug}', '${type}')">← Kembali ke Info Komik</div>
+                <h2 style="text-align:center; color: var(--text);">${komikJudul}</h2>
+                <div class="reader">${html}</div>
+                <div class="back" onclick="loadInfo('${slug}', '${type}')" style="margin-top:20px;">← Kembali ke Info Komik</div>
+            `;
+            window.scrollTo(0, 0);
+        } catch (e) {
+            console.error("Gagal loadChapter:", e);
+            appContainer.innerHTML = `<p>Gagal memuat chapter.</p><div class="back" onclick="loadInfo('${slug}', '${type}')">← Kembali ke Info Komik</div>`;
+        }
+    }
+
+    function goBack() {
+        history.back(); // Ini akan memicu 'hashchange'
+    }
+
+
+    // --- FUNGSI HELPER (CACHE, RATING, UI, DLL) ---
+
+    /**
+     * (OPTIMISASI 3) 
+     * Menjalankan fungsi callback saat browser sedang idle (tidak sibuk).
+     */
+    function deferHeavyWork(callback) {
+      if ('requestIdleCallback' in window) {
+        // Gunakan API modern jika ada (Chrome, Firefox, Edge)
+        window.requestIdleCallback(callback, { timeout: 2000 }); // timeout 2 detik
+      } else {
+        // Fallback untuk browser (seperti Safari)
+        setTimeout(callback, 1); 
+      }
+    }
+
+    async function fetchAndCache(url, cacheKey, type = 'json') {
+        if (dataCache.has(cacheKey)) {
+            return dataCache.get(cacheKey);
+        }
+        const res = await fetch(url);
+        if (!res.ok) {
+            throw new Error(`Gagal memuat: ${url}`);
+        }
+        const data = (type === 'json') ? await res.json() : await res.text();
+        dataCache.set(cacheKey, data);
+        return data;
+    }
+
+    function generateStars(rating) {
+        const score = (parseFloat(rating) || 0) / 2;
+        let html = '';
+        for (let i = 1; i <= 5; i++) {
+            if (i <= score) {
+                html += '<i class="ph-fill ph-star"></i>';
+            } else if (i - 0.5 <= score) {
+                html += '<i class="ph-fill ph-star-half"></i>'; 
+            } else {
+                html += '<i class="ph ph-star"></i>';
+            }
+        }
+        return html;
+    }
+
+    /**
+     * (OPTIMISASI 4) Menggantikan createCardHTML
+     * Fungsi ini membuat ELEMEN DOM murni, bukan string.
+     */
+    function createCardElement(item) {
+        const itemTipe = (item.tipe || currentView).toLowerCase();
+        const judul = item.judul || 'Tanpa Judul';
+        const slug = item.slug;
+        const thumbnail = item.thumbnail;
+        const ratingScore = item.rating ? parseFloat(item.rating).toFixed(1) : '0.0';
+        const starHTML = generateStars(item.rating); // String kecil ini tidak masalah
+
+        const card = document.createElement('div');
+        card.className = 'card';
+        card.onclick = () => loadInfo(slug, itemTipe);
+
+        card.innerHTML = `
+            <img src="${thumbnail}" alt="${judul}" loading="lazy">
+            <div class="title">${judul}</div>
+            <div class="rating-info">
+                <div class="stars-container">${starHTML}</div>
+                <span class="rating-score">${ratingScore}</span>
+            </div>`;
+        return card;
+    }
+
+    /**
+     * (OPTIMISASI 4) Menggunakan DocumentFragment
+     * Ini adalah cara paling efisien untuk me-render banyak elemen ke DOM.
+     */
+    function displayComics(data) {
+        if (!data || data.length === 0) {
+            appContainer.innerHTML = "<p>Tidak ada komik yang ditemukan.</p>";
+            return;
+        }
+
+        const grid = document.createElement('div');
+        grid.className = 'grid';
+        
+        // 1. Buat "keranjang" di memori
+        const fragment = document.createDocumentFragment();
+
+        // 2. Isi keranjang dengan elemen card (masih di memori)
+        data.forEach(item => {
+            fragment.appendChild(createCardElement(item));
+        });
+
+        // 3. Masukkan keranjang ke grid (masih di memori)
+        grid.appendChild(fragment);
+        
+        // 4. Hapus "Loading..." dan "tuang" grid ke DOM (HANYA 1x Operasi)
+        appContainer.innerHTML = ''; 
+        appContainer.appendChild(grid);
+    }
+
+
+    function createPagination({ currentPage, totalPages, hasNextPage = false }) {
+        const pagination = document.createElement("div");
+        pagination.className = "pagination";
+        let buttonsHTML = '';
+        
+        const prevPage = currentPage - 1;
+        const nextPage = currentPage + 1;
+        let prevAction, nextAction;
+
+        switch(currentMode) {
+            case 'advanced-filter':
+                prevAction = `applyFiltersWorker(${prevPage}, true)`;
+                nextAction = `applyFiltersWorker(${nextPage}, true)`;
+                break;
+            default: // 'browse'
+                prevAction = `loadPageFromRepo(${prevPage}, true)`;
+                nextAction = `loadPageFromRepo(${nextPage}, true)`;
+        }
+
+        if (currentPage > 1) {
+            buttonsHTML += `<button class="page-btn" onclick="${prevAction}">⬅ Sebelumnya</button>`;
+        }
+        if ((currentMode !== 'browse' && currentPage < totalPages) || (currentMode === 'browse' && hasNextPage)) {
+            buttonsHTML += `<button class="page-btn" onclick="${nextAction}">Berikutnya ➡</button>`;
+        }
+
+        pagination.innerHTML = buttonsHTML;
+        return pagination;
+    }
+
+    function resetFilters() {
+        /* (OPTIMISASI 2) Gunakan variabel yang sudah di-cache */
+        authorInput.value = '';
+        tahunInput.value = '';
+        ratingInput.value = '';
+        statusSelect.value = '';
+        genreListContainer.querySelectorAll('input:checked').forEach(cb => cb.checked = false);
+    }
+
+    async function loadGenres() {
+        /* (OPTIMISASI 2) Gunakan variabel yang sudah di-cache */
+        const container = genreListContainer; 
+        if (currentView === 'home') {
+            container.innerHTML = "Pilih tipe komik untuk melihat genre.";
+            return;
+        }
+        // === PERUBAHAN ===
+        // URL menunjuk ke Worker dengan aksi 'getGenres'
+        const cacheKey = `${currentView}-genres`;
+        const url = `${WORKER_URL}?action=getGenres&type=${currentView}`;
+        // =================
+        try {
+            const data = await fetchAndCache(url, cacheKey, 'json');
+            buildGenreList(data);
+        } catch (e) {
+            container.innerHTML = "<p>Gagal memuat genre.</p>";
+        }
+    }
+
+    function buildGenreList(data) {
+        /* (OPTIMISASI 2) Gunakan variabel yang sudah di-cache */
+        const container = genreListContainer;
+        container.innerHTML = (data.list || [])
+            .map(g => `<label><input type="checkbox" value="${g}"> ${g}</label>`)
+            .join("");
+        
+        if(currentMode === 'advanced-filter') {
+            updateFilterInputsFromState();
+        }
+    }
+
+    function capitalize(s) {
+        return s ? s.charAt(0).toUpperCase() + s.slice(1) : '';
+    }
+
+    function handleSearchClear() {
+      searchInput.addEventListener('input', () => {
+        clearBtn.classList.toggle('visible', searchInput.value.length > 0);
+      });
+      clearBtn.addEventListener('click', () => {
+        searchInput.value = '';
+        clearBtn.classList.remove('visible');
+        searchInput.focus();
+        if (currentMode === 'advanced-filter') {
+            handleFilter();
+        }
+      });
+    }
+
+    function moveUnderline(button) {
+      const textSpan = button.querySelector('span');
+      if (!textSpan) return;
+      const textWidth = textSpan.offsetWidth;
+      const buttonLeft = button.offsetLeft;
+      const buttonWidth = button.offsetWidth;
+      const leftPosition = buttonLeft + (buttonWidth - textWidth) / 2;
+      
+      /* (OPTIMISASI 1) Ganti 'left' dengan 'transform' dan 'width' */
+      underline.style.width = textWidth + 'px';
+      underline.style.transform = `translateX(${leftPosition}px)`;
+    }
+
+    function updateUIVisibility(tabName) {
+      if (tabName === 'Home') {
+        appbar.classList.remove('search-expanded');
+        filterBtn.classList.remove('visible');
+        searchInput.placeholder = "Cari di ReComic's...";
+      } else {
+        appbar.classList.add('search-expanded');
+        filterBtn.classList.add('visible');
+        searchInput.placeholder = `Cari di ${tabName}...`;
+      }
+    }
+
+    // --- INISIALISASI DAN EVENT LISTENER ---
+
+    function initializeApp() {
+        handleSearchClear();
+
+        window.addEventListener('hashchange', handleRouting);
+
+        tabs.forEach(btn => {
+          btn.addEventListener('click', (e) => {
+            if (btn.classList.contains('active')) return;
+            const tabName = btn.querySelector('span').textContent.toLowerCase();
+            
+            /* --- (OPTIMISASI 5) INI PERUBAHAN PALING PENTING --- */
+            
+            // 1. Jalankan animasi UI SEGERA
+            // Ini akan memicu animasi appbar (logo/search) DAN underline
+            updateActiveTabUI(tabName); 
+            
+            // 2. Panggil logika SETELAH UI di-update
+            // (handleTypeChange akan mendefer loading data)
+            handleTypeChange(tabName, true); 
+          });
+        });
+        
+        searchInput.addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                e.preventDefault(); 
+                if (currentView !== 'home') {
+                    handleFilter(); // handleFilter akan mengupdate HASH & menunda load
+                    searchInput.blur();
+                }
+            }
+        });
+
+        // Listener untuk panel filter
+        filterBtn.addEventListener('click', () => {
+          filterOverlay.classList.add('visible');
+        });
+        closeFilterBtn.addEventListener('click', () => {
+          filterOverlay.classList.remove('visible');
+        });
+        filterOverlay.addEventListener('click', (e) => {
+          if (e.target === filterOverlay) {
+            filterOverlay.classList.remove('visible');
+          }
+        });
+
+        // Panggil router untuk memuat halaman awal berdasarkan HASH
+        handleRouting();
+    }
+
+    document.addEventListener("DOMContentLoaded", initializeApp);
 
   </script>
 
